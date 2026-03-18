@@ -1,0 +1,74 @@
+---
+title: "Chatbot Time Savings Estimation"
+output: pdf_document
+---
+
+### Data
+
+Work order table has `hours_worked`, `project_cost`, `employee_id`, `wo_start_date`, `wo_end_date`, `location`, and `wo_number`. Available pre and post deployment.
+
+Chatbot session logs have `session_duration`, `user_id`, and `wo_referenced`. Post deployment only. Join to work orders on `wo_referenced` = `wo_number` and `user_id` = `employee_id`. If multiple sessions hit the same work order, sum the durations.
+
+
+### The problem
+
+`hours_worked` on any work order includes both the actual physical maintenance work and the time spent looking up information about the work order. 
+
+ Post the chatbot we have `session_duration` which = lookup time. 
+
+ Want to know duration of this pre chatbot 
+
+
+### How the estimation works
+
+`hours_worked` = labor + retrieval time. The chatbot only affects retrieval. So:
+
+**Post-period**, we have both pieces. Retrieval = `session_duration` from the logs. Labor falls out directly:
+
+$$L_{ijt} = \texttt{hours\_worked}_{ijt}^{\text{post}} - \texttt{session\_duration}_{ijt}$$
+
+**fit model on labor values** to understand how labor relates to job size and employee. This is to predict reasonably what labor would look like on pre-period jobs so that we can amke any casual claim:
+
+$$\log(L_{ijt}) = \mu + \beta \cdot \log(\texttt{project\_cost}_{ijt}) + \alpha_j + \epsilon_{ijt}$$
+
+`project_cost` is here because a big job takes more labor than a small job. Control for amgnitude to compare across periods. $\alpha_j$ is an employee effect random intercept.
+
+**Pre-period**, we only have `hours_worked`. For each pre-period work order we predict labor using its cost and employee:
+
+$$\hat{L}_{ijt}^{\text{pre}} = \exp\left(\hat{\mu} + \hat{\beta} \cdot \log(\texttt{project\_cost}_{ijt}^{\text{pre}}) + \hat{\alpha}_j\right)$$
+
+Then the manual retrieval timeis  what's left over:
+
+$$\hat{R}_{ijt}^{\text{manual}} = \texttt{hours\_worked}_{ijt}^{\text{pre}} - \hat{L}_{ijt}^{\text{pre}}$$
+
+ $\hat{R}^{\text{manual}}$ is `hours_worked` minus predicted labor, and the predicted labor comes from a model trained entirely on observed data from the post-period.
+
+Time savings:
+
+$$\Delta R = \hat{R}^{\text{manual}} - \overline{\texttt{session\_duration}}$$
+
+
+### Why Bayesian
+
+The labor prediction $\hat{L}^{\text{pre}}$ has uncertainty. The regression parameters ($\mu$, $\beta$, $\alpha_j$) are estimates, not exact. If they shift a little, $\hat{L}$ shifts, $\hat{R}^{\text{manual}}$ shifts, and $\Delta R$ shifts.
+
+Standard regression gives you one set of parameters for estimates. Bayesian estimation gives you thousands of draws from the posterior of $(\mu, \beta, \alpha_j)$. For each draw $s$:
+
+$$\hat{L}^{(s)} = \exp\left(\mu^{(s)} + \beta^{(s)} \cdot \log(\texttt{project\_cost}^{\text{pre}}) + \alpha_j^{(s)}\right)$$
+$$\hat{R}^{\text{manual},(s)} = \texttt{hours\_worked}^{\text{pre}} - \hat{L}^{(s)}$$
+$$\Delta R^{(s)} = \hat{R}^{\text{manual},(s)} - \overline{\texttt{session\_duration}}$$
+
+After thousand iterations you develop a distribtuion of $\Delta R$, not a point estimate. Report the median and a credible interval. This is my best attempt to preserve a causal estimate, without using survey data int eh pre period and time constraints. 
+
+
+### *Assumption to note*
+
+Physical labor time on a job of given cost for a given employee *hasn't changed between periods*. The chatbot changes lookup speed onnly. If this doesn't hold the estimate is biased.
+
+
+### Results
+
+- Posterior distribution of $\Delta R$ (minutes saved per lookup) with credible interval
+- $P(\Delta R > 0)$: probability the chatbot actually saves time
+- Total hours saved = $\Delta R \times$ number of post-period sessions
+
