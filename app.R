@@ -1,88 +1,209 @@
+# =============================================================================
+# app.R  —  Chatbot Time Savings Dashboard
+# Hosted as a Databricks App (deployed via Databricks Apps, NOT shinyApp() local)
+#
+# Runtime dependencies:
+#   - Model results pre-computed by model_job.R run as a weekly Databricks Job
+#     Saved to DBFS as an RDS file — app only reads, never re-fits.
+#   - SQL Warehouse reachable via the env vars below.
+#
+# Required environment variables (set in Databricks App config or .Renviron):
+#   DATABRICKS_HOST        e.g. "adb-<workspace-id>.azuredatabricks.net"
+#   DATABRICKS_HTTP_PATH   e.g. "/sql/1.0/warehouses/<warehouse-id>"
+#   DATABRICKS_TOKEN       personal access token or service-principal secret
+#   DB_CATALOG             Unity Catalog name          (default: hive_metastore)
+#   DB_SCHEMA              schema / database name      (default: default)
+#   MODEL_RDS_PATH         DBFS path to model RDS      (default below)
+#   USE_SPARKLYR           set to "true" to use sparklyr instead of ODBC
+# =============================================================================
+
 library(shiny)
-library(rstanarm)
+library(DBI)
+library(odbc)
 library(dplyr)
 
-# ---------------------------------------------------------------
-# DATA — replace with DB pull
-# con <- dbConnect(...)
-# df <- dbGetQuery(con, "SELECT ... FROM work_orders LEFT JOIN sessions ...")
-# ---------------------------------------------------------------
+# sparklyr is optional — only loaded if USE_SPARKLYR=true
+USE_SPARKLYR <- identical(Sys.getenv("USE_SPARKLYR"), "true")
+if (USE_SPARKLYR) library(sparklyr)
 
-set.seed(42)
-n_emp <- 40; n_pre <- 600; n_post <- 400
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+DB_HOST    <- Sys.getenv("DATABRICKS_HOST",     "")
+DB_HTTP    <- Sys.getenv("DATABRICKS_HTTP_PATH", "")
+DB_TOKEN   <- Sys.getenv("DATABRICKS_TOKEN",     "")
+DB_CATALOG <- Sys.getenv("DB_CATALOG",  "hive_metastore")
+DB_SCHEMA  <- Sys.getenv("DB_SCHEMA",   "default")
+MODEL_PATH <- Sys.getenv("MODEL_RDS_PATH",
+                          "/dbfs/mnt/models/chatbot_model_results.rds")
 
-emp <- data.frame(
-  employee_id = paste0("E", sprintf("%03d", 1:n_emp)),
-  location = sample(c("BLDG_A","BLDG_B","BLDG_C","BLDG_D"), n_emp, replace=T),
-  gs_scale = sample(c(7,9,11,12,13), n_emp, replace=T),
-  alpha_L = rnorm(n_emp, 0, 0.3),
-  alpha_R = rnorm(n_emp, 0, 0.4)
-)
+# Chunk size for collecting large result sets incrementally (rows per fetch)
+CHUNK_SIZE <- as.integer(Sys.getenv("CHUNK_SIZE", "50000"))
 
-make_wo <- function(n, period, emp) {
-  d <- data.frame(
-    wo_number = paste0("WO-", period, "-", sprintf("%04d", 1:n)),
-    employee_id = sample(emp$employee_id, n, replace=T),
-    project_cost = exp(rnorm(n, log(5000), 0.8)),
-    wo_start_date = as.Date(ifelse(period=="PRE", "2024-01-01", "2025-01-15")) + sample(0:180, n, replace=T),
-    post = ifelse(period=="PRE", 0, 1)
+# -----------------------------------------------------------------------------
+# CONNECTION HELPERS
+# -----------------------------------------------------------------------------
+
+# ODBC connection to Databricks SQL Warehouse
+odbc_connect <- function() {
+  dbConnect(
+    odbc::odbc(),
+    Driver          = "Simba Spark ODBC Driver",
+    Host            = DB_HOST,
+    Port            = 443,
+    HTTPPath        = DB_HTTP,
+    AuthMech        = 3,
+    UID             = "token",
+    PWD             = DB_TOKEN,
+    ThriftTransport = 2
   )
-  d <- merge(d, emp, by="employee_id")
-  d$true_L <- exp(1.2 + 0.45*log(d$project_cost) - 0.02*d$gs_scale + d$alpha_L + rnorm(n,0,0.25))
-  if (period=="PRE") {
-    d$true_R <- exp(log(0.25) + 0.08*log(d$project_cost) + d$alpha_R + rnorm(n,0,0.4))
-    d$session_duration <- NA
-  } else {
-    d$true_R <- exp(log(0.05) + 0.03*log(d$project_cost) + rnorm(n,0,0.3))
-    d$session_duration <- d$true_R
-  }
-  d$hours_worked <- d$true_L + d$true_R + abs(rnorm(n,0,0.1))
-  d
 }
 
-pre <- make_wo(n_pre, "PRE", emp)
-post_raw <- make_wo(n_post, "POST", emp)
-df <- bind_rows(pre, post_raw) %>%
-  select(wo_number, employee_id, project_cost, hours_worked, session_duration,
-         post, location, gs_scale, wo_start_date)
+# sparklyr connection — used when USE_SPARKLYR=true
+# (handles clusters too large for ODBC result sets)
+sparklyr_connect <- function() {
+  config <- spark_config()
+  config$`sparklyr.shell.driver-memory` <- "4g"
+  spark_connect(
+    method  = "databricks",
+    cluster = Sys.getenv("DATABRICKS_CLUSTER_ID", ""),
+    config  = config
+  )
+}
 
+# Returns the active connection (ODBC or sparklyr) for a query block.
+# Always call db_disconnect(con) in on.exit().
+db_connect <- function() {
+  if (USE_SPARKLYR) sparklyr_connect() else odbc_connect()
+}
 
-# ---------------------------------------------------------------
-# MODEL — move to batch job later
-# TODO: saveRDS(results, "model_results.rds")
-# TODO: replace below with res <- readRDS("model_results.rds")
-# ---------------------------------------------------------------
+db_disconnect <- function(con) {
+  if (USE_SPARKLYR) spark_disconnect(con) else dbDisconnect(con)
+}
 
-df_post <- df %>% filter(post==1, !is.na(session_duration)) %>%
-  mutate(implied_L = hours_worked - session_duration) %>%
-  filter(implied_L > 0) %>%
-  mutate(log_L = log(implied_L), log_cost = log(project_cost))
+# -----------------------------------------------------------------------------
+# LARGE-DATA QUERY HELPERS
+# All aggregation happens in SQL — only small result sets come to R.
+# For tables with billions of rows use APPROX_COUNT_DISTINCT to avoid full scans.
+# -----------------------------------------------------------------------------
 
-df_pre <- df %>% filter(post==0) %>% mutate(log_cost = log(project_cost))
+pull_summary_counts <- function() {
+  con <- db_connect()
+  on.exit(db_disconnect(con), add = TRUE)
 
-fit <- stan_lmer(
-  log_L ~ log_cost + (1 | employee_id),
-  data = df_post,
-  prior = normal(0,1), prior_intercept = normal(0,2),
-  chains = 4, iter = 4000, warmup = 2000,
-  seed = 42, refresh = 0
+  if (USE_SPARKLYR) {
+    tbl(con, paste0("`", DB_CATALOG, "`.`", DB_SCHEMA, "`.work_orders")) |>
+      summarise(
+        n_pre      = approx_count_distinct(if_else(post == 0, wo_number, NA_character_)),
+        n_post     = approx_count_distinct(if_else(post == 1, wo_number, NA_character_)),
+        n_sessions = approx_count_distinct(if_else(post == 1 & !is.na(session_duration),
+                                                   wo_number, NA_character_))
+      ) |>
+      collect()
+  } else {
+    dbGetQuery(con, sprintf(
+      "SELECT
+         APPROX_COUNT_DISTINCT(CASE WHEN post = 0 THEN wo_number END) AS n_pre,
+         APPROX_COUNT_DISTINCT(CASE WHEN post = 1 THEN wo_number END) AS n_post,
+         APPROX_COUNT_DISTINCT(CASE WHEN post = 1
+                                    AND session_duration IS NOT NULL
+                               THEN wo_number END)                     AS n_sessions
+       FROM %s.%s.work_orders",
+      DB_CATALOG, DB_SCHEMA
+    ))
+  }
+}
+
+# Random sample of post-period session durations for histogram.
+# LIMIT keeps this small regardless of table size — SQL engine does the work.
+pull_session_sample <- function(n = 2000L) {
+  con <- db_connect()
+  on.exit(db_disconnect(con), add = TRUE)
+
+  if (USE_SPARKLYR) {
+    tbl(con, paste0("`", DB_CATALOG, "`.`", DB_SCHEMA, "`.work_orders")) |>
+      filter(post == 1, !is.na(session_duration)) |>
+      select(session_duration) |>
+      sdf_sample(fraction = 0.01, replacement = FALSE) |>
+      head(n) |>
+      collect() |>
+      pull(session_duration)
+  } else {
+    dbGetQuery(con, sprintf(
+      "SELECT session_duration
+       FROM %s.%s.work_orders
+       WHERE post = 1
+         AND session_duration IS NOT NULL
+       ORDER BY RAND()
+       LIMIT %d",
+      DB_CATALOG, DB_SCHEMA, n
+    ))$session_duration
+  }
+}
+
+# Chunked collector — use this if you ever need to pull a large result set
+# into R in pieces rather than all at once (e.g. for export or full-data ops).
+# Not used by the dashboard directly but available for model_job.R.
+collect_in_chunks <- function(con, query, chunk_size = CHUNK_SIZE) {
+  rs  <- dbSendQuery(con, query)
+  out <- list()
+  while (!dbHasCompleted(rs)) {
+    chunk <- dbFetch(rs, n = chunk_size)
+    if (nrow(chunk) == 0) break
+    out <- c(out, list(chunk))
+  }
+  dbClearResult(rs)
+  bind_rows(out)
+}
+
+# -----------------------------------------------------------------------------
+# LOAD PRE-COMPUTED MODEL RESULTS FROM DBFS
+# model_job.R runs weekly as a Databricks Job and writes this file.
+# The app reads it once at startup — never re-fits the model.
+# -----------------------------------------------------------------------------
+load_model_results <- function(path = MODEL_PATH) {
+  if (!file.exists(path)) {
+    stop(
+      "Model results not found at: ", path,
+      "\nRun model_job.R as a weekly Databricks Job to generate them."
+    )
+  }
+  readRDS(path)
+}
+
+# Load once at app startup
+res            <- load_model_results()
+delta_R        <- res$delta_R          # posterior draws: minutes saved per lookup
+R_manual_avg   <- res$R_manual_avg     # posterior draws: avg manual retrieval (hrs)
+mean_session   <- res$mean_session     # scalar: mean observed chatbot session (hrs)
+n_sessions     <- res$n_sessions       # scalar: count of post-period sessions
+total_hrs      <- res$total_hrs        # posterior draws: total hours saved
+model_run_date <- res$model_run_date   # POSIXct: when model_job.R last ran
+
+# Pull summary counts once at startup (tiny query)
+summary_counts <- tryCatch(
+  pull_summary_counts(),
+  error = function(e) {
+    warning("DB summary query failed: ", conditionMessage(e))
+    data.frame(n_pre = NA_integer_, n_post = NA_integer_, n_sessions = NA_integer_)
+  }
 )
 
-L_draws <- posterior_predict(fit, newdata=df_pre, draws=2000)
-R_manual <- sweep(-exp(L_draws), 2, df_pre$hours_worked, "+")
-R_manual_avg <- rowMeans(R_manual)
-mean_session <- mean(df_post$session_duration)
-delta_R <- (R_manual_avg - mean_session) * 60
+n_pre_wo  <- summary_counts$n_pre[1]
+n_post_wo <- summary_counts$n_post[1]
 
-n_sessions <- nrow(df_post)
-total_hrs <- delta_R / 60 * n_sessions
-model_run_date <- Sys.time()
+session_sample <- tryCatch(
+  pull_session_sample(),
+  error = function(e) {
+    warning("DB session sample query failed: ", conditionMessage(e))
+    numeric(0)
+  }
+)
 
 
-# ---------------------------------------------------------------
-# DASHBOARD
-# ---------------------------------------------------------------
-
+# =============================================================================
+# UI
+# =============================================================================
 ui <- fluidPage(
   tags$head(tags$style(HTML("
     body { background: #f4f4f7; font-family: -apple-system, sans-serif; padding: 10px; }
@@ -96,78 +217,100 @@ ui <- fluidPage(
     td { padding: 6px 10px; font-size: 13px; }
   "))),
 
-  div(style="max-width: 1100px; margin: auto;",
+  div(style = "max-width: 1100px; margin: auto;",
 
-    h2("Chatbot Time Savings", style="color:#222; margin-bottom: 2px;"),
-    p(style="color:#999; font-size: 12px; margin-bottom: 16px;",
-      paste0("Model run: ", format(model_run_date, "%b %d, %Y %I:%M %p"),
-             " | Pre: ", nrow(df_pre), " WOs",
-             " | Post: ", nrow(df_post), " WOs",
-             " | ", n_sessions, " sessions")),
+    h2("Chatbot Time Savings", style = "color:#222; margin-bottom: 2px;"),
+    p(style = "color:#999; font-size: 12px; margin-bottom: 16px;",
+      paste0(
+        "Model run: ", format(model_run_date, "%b %d, %Y %I:%M %p"),
+        " | Pre: ",  if (is.na(n_pre_wo))  "N/A" else n_pre_wo,  " WOs",
+        " | Post: ", if (is.na(n_post_wo)) "N/A" else n_post_wo, " WOs",
+        " | ", n_sessions, " sessions"
+      )
+    ),
 
     fluidRow(
-      column(3, div(class="box",
-        div(class="lbl", "Savings per lookup"),
-        div(class="val", paste0(round(median(delta_R),1), " min")),
-        div(class="sub", paste0("90% CI: [", round(quantile(delta_R,0.05),1),
-                                ", ", round(quantile(delta_R,0.95),1), "]"))
+      column(3, div(class = "box",
+        div(class = "lbl", "Savings per lookup"),
+        div(class = "val", paste0(round(median(delta_R), 1), " min")),
+        div(class = "sub", paste0(
+          "90% CI: [", round(quantile(delta_R, 0.05), 1),
+          ", ",        round(quantile(delta_R, 0.95), 1), "]"
+        ))
       )),
-      column(3, div(class="box",
-        div(class="lbl", "P(savings > 0)"),
-        div(class="val", paste0(round(mean(delta_R>0)*100,1), "%")),
-        div(class="sub", "Posterior probability")
+      column(3, div(class = "box",
+        div(class = "lbl", "P(savings > 0)"),
+        div(class = "val", paste0(round(mean(delta_R > 0) * 100, 1), "%")),
+        div(class = "sub", "Posterior probability")
       )),
-      column(3, div(class="box",
-        div(class="lbl", "Manual retrieval (est.)"),
-        div(class="val", paste0(round(median(R_manual_avg)*60,1), " min")),
-        div(class="sub", "Bayesian posterior median")
+      column(3, div(class = "box",
+        div(class = "lbl", "Manual retrieval (est.)"),
+        div(class = "val", paste0(round(median(R_manual_avg) * 60, 1), " min")),
+        div(class = "sub", "Bayesian posterior median")
       )),
-      column(3, div(class="box",
-        div(class="lbl", "Chatbot session (obs.)"),
-        div(class="val", paste0(round(mean_session*60,1), " min")),
-        div(class="sub", paste0("Mean of ", n_sessions, " sessions"))
+      column(3, div(class = "box",
+        div(class = "lbl", "Chatbot session (obs.)"),
+        div(class = "val", paste0(round(mean_session * 60, 1), " min")),
+        div(class = "sub", paste0("Mean of ", n_sessions, " sessions"))
       ))
     ),
 
     fluidRow(
-      column(4, div(class="box", plotOutput("p1", height="260px"))),
-      column(4, div(class="box", plotOutput("p2", height="260px"))),
-      column(4, div(class="box", plotOutput("p3", height="260px")))
+      column(4, div(class = "box", plotOutput("p1", height = "260px"))),
+      column(4, div(class = "box", plotOutput("p2", height = "260px"))),
+      column(4, div(class = "box", plotOutput("p3", height = "260px")))
     ),
 
-    div(class="box",
-      div(class="section-title", "Total Savings"),
+    div(class = "box",
+      div(class = "section-title", "Total Savings"),
       tags$table(
-        tags$tr(tags$td("Hours saved (median)"), tags$td(style="font-weight:600;", paste0(round(median(total_hrs),0), " hrs"))),
-        tags$tr(tags$td("90% CI"), tags$td(paste0("[", round(quantile(total_hrs,0.05),0), ", ", round(quantile(total_hrs,0.95),0), "]"))),
-        tags$tr(tags$td("Based on"), tags$td(paste0(n_sessions, " sessions")))
+        tags$tr(tags$td("Hours saved (median)"),
+                tags$td(style = "font-weight:600;",
+                        paste0(round(median(total_hrs), 0), " hrs"))),
+        tags$tr(tags$td("90% CI"),
+                tags$td(paste0("[", round(quantile(total_hrs, 0.05), 0),
+                               ", ", round(quantile(total_hrs, 0.95), 0), "]"))),
+        tags$tr(tags$td("Based on"),
+                tags$td(paste0(n_sessions, " sessions")))
       )
     )
   )
 )
 
+
+# =============================================================================
+# SERVER
+# =============================================================================
 server <- function(input, output, session) {
 
   output$p1 <- renderPlot({
-    par(mar=c(4,3,2,1))
-    hist(delta_R, breaks=40, col="#4a7fb5", border="white",
-         main="Minutes Saved per Lookup", xlab="minutes", ylab="", cex.main=0.9)
-    abline(v=median(delta_R), col="red", lwd=2, lty=2)
-    abline(v=0, lty=3)
+    par(mar = c(4, 3, 2, 1))
+    hist(delta_R, breaks = 40, col = "#4a7fb5", border = "white",
+         main = "Minutes Saved per Lookup", xlab = "minutes", ylab = "",
+         cex.main = 0.9)
+    abline(v = median(delta_R), col = "red", lwd = 2, lty = 2)
+    abline(v = 0, lty = 3)
   })
 
   output$p2 <- renderPlot({
-    par(mar=c(4,3,2,1))
-    hist(R_manual_avg*60, breaks=40, col="#d4873f", border="white",
-         main="Estimated Manual Retrieval", xlab="minutes", ylab="", cex.main=0.9)
-    abline(v=median(R_manual_avg)*60, col="red", lwd=2, lty=2)
+    par(mar = c(4, 3, 2, 1))
+    hist(R_manual_avg * 60, breaks = 40, col = "#d4873f", border = "white",
+         main = "Estimated Manual Retrieval", xlab = "minutes", ylab = "",
+         cex.main = 0.9)
+    abline(v = median(R_manual_avg) * 60, col = "red", lwd = 2, lty = 2)
   })
 
   output$p3 <- renderPlot({
-    par(mar=c(4,3,2,1))
-    hist(df_post$session_duration*60, breaks=30, col="#3a8a5c", border="white",
-         main="Observed Chatbot Sessions", xlab="minutes", ylab="", cex.main=0.9)
-    abline(v=mean_session*60, col="red", lwd=2, lty=2)
+    par(mar = c(4, 3, 2, 1))
+    if (length(session_sample) == 0) {
+      plot.new()
+      text(0.5, 0.5, "Session data unavailable", cex = 1.2, col = "#999")
+    } else {
+      hist(session_sample * 60, breaks = 30, col = "#3a8a5c", border = "white",
+           main = "Observed Chatbot Sessions", xlab = "minutes", ylab = "",
+           cex.main = 0.9)
+      abline(v = mean_session * 60, col = "red", lwd = 2, lty = 2)
+    }
   })
 }
 
